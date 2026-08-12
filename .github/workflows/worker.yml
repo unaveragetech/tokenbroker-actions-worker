@@ -1,0 +1,30 @@
+name: TokenBroker Worker (standing node)
+
+on:
+  # Actions jobs max out at 6h; re-fire every ~5h so a node is standing with
+  # only a short gap between runners (each run keeps the same node token, so
+  # it is the same compute node coming back online).
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: tokenbroker-worker
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Run headless worker
+        env:
+          TB_GATEWAY: ${{ secrets.TB_GATEWAY }}
+          TB_NODE_TOKEN: ${{ secrets.TB_NODE_TOKEN }}
+          TB_NAME: actions-worker
+        run: bash run-worker.sh

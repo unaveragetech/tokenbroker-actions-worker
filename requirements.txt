@@ -1,0 +1,1 @@
+# worker.py uses only the Python standard library (urllib/subprocess).
