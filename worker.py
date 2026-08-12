@@ -1590,6 +1590,11 @@ def main():
     ap.add_argument("--name", default="My Worker")
     ap.add_argument("--interval", type=int, default=30)
     ap.add_argument("--headless", action="store_true", help="Run without the UI window")
+    ap.add_argument(
+        "--multi",
+        action="store_true",
+        help="Allow multiple worker instances on one machine (e.g. several workers sharing one Ollama server)",
+    )
     args = ap.parse_args()
 
     gateway = args.gateway
@@ -1642,7 +1647,7 @@ def main():
         print("Missing gateway URL or worker token. Use --gateway/--token or a worker-config.json.")
         sys.exit(1)
 
-    if another_instance_running():
+    if another_instance_running() and not args.multi:
         _log_crash("another instance is already running; exiting cleanly")
         print("Another TokenBroker worker is already running on this machine. Exiting.")
         sys.exit(0)

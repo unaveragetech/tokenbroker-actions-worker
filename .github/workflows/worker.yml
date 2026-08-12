@@ -1,16 +1,12 @@
-name: TokenBroker Worker (standing node)
+name: TokenBroker Worker (standing nodes)
 
 on:
-  # Actions jobs max out at 6h; re-fire every ~5h so a node is standing with
-  # only a short gap between runners (each run keeps the same node token, so
-  # it is the same compute node coming back online).
+  # Actions jobs max out at ~6h; re-fire every ~5h so the nodes are standing
+  # with only a short gap between runners (each run reuses the same node
+  # tokens, so it is the same compute nodes coming back online).
   schedule:
     - cron: '0 */5 * * *'
   workflow_dispatch:
-
-concurrency:
-  group: tokenbroker-worker
-  cancel-in-progress: false
 
 jobs:
   worker:
@@ -19,12 +15,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Share pulled Ollama models across runs: every runner restores the
+      # cached ~/.ollama (models) from the previous run and saves what remains
+      # at the end, so repeat workloads skip the download.
+      - name: Restore Ollama model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ollama-models-v1
+          restore-keys: ollama-models-v1
+
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Run headless worker
+      # Three worker instances on this runner share ONE local Ollama server
+      # (multi-worker mode), so a single run serves up to three jobs at once.
+      # Models pulled by one worker are instantly visible to the others.
+      - name: Run 3 headless workers (shared Ollama)
         env:
           TB_GATEWAY: ${{ secrets.TB_GATEWAY }}
           TB_NODE_TOKEN: ${{ secrets.TB_NODE_TOKEN }}
-          TB_NAME: actions-worker
-        run: bash run-worker.sh
+          TB_NODE_TOKEN_2: ${{ secrets.TB_NODE_TOKEN_2 }}
+          TB_NODE_TOKEN_3: ${{ secrets.TB_NODE_TOKEN_3 }}
+        run: bash run-workers.sh
