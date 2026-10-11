@@ -114,6 +114,12 @@ def _show_error(text):
 def crash_hook(exc_type, exc_value, exc_tb):
     detail = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     _log_crash(detail)
+    try:
+        # Also surface it on stderr: headless/CI runs only see the console.
+        sys.stderr.write(detail)
+        sys.stderr.flush()
+    except Exception:
+        pass
     if getattr(sys, "frozen", False):
         _show_error(
             "TokenBroker worker hit an unexpected error and stopped.\n\n"
@@ -271,6 +277,15 @@ def _win_hw_python():
     except Exception:
         pass
     return info
+
+
+def _read(path):
+    """Best-effort text read of a sysfs/procfs file ('' if missing or unreadable)."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
 
 
 def gather_hw():
