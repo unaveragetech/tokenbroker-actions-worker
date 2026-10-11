@@ -29,7 +29,7 @@ jobs:
         env:
           TB_GATEWAY: ${{ secrets.TB_GATEWAY }}
           TB_API_KEY: ${{ secrets.TB_API_KEY }}
-          KEEPALIVE_MODEL: llama3.2:1b
+          KEEPALIVE_MODEL: qwen2.5:1.5b
         run: |
           if [ -z "${TB_API_KEY:-}" ]; then
             echo "::warning::TB_API_KEY secret not set - skipped the prompt (workflows were still re-enabled)"
