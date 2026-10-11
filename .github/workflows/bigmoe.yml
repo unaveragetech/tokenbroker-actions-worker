@@ -1,0 +1,34 @@
+name: TokenBroker BigMoe worker (standing node)
+
+# One extra node that serves bmoe-qwen3-30b-a3b: the BigMoeOnEdge engine
+# (bin/bmoe-cli, pinned) streams the 30B MoE model's experts from the runner's
+# SSD. The GGUF is stored in this repo's release (model-qwen3-30b-a3b-q3_k_m),
+# so runs never touch Hugging Face. It runs on its own runner, separate from
+# the three Ollama workers in worker.yml, so the 16 GB of RAM is all the engine's.
+on:
+  schedule:
+    - cron: '30 */6 * * *'
+  workflow_dispatch:
+
+# Two runs must never share the node token.
+concurrency:
+  group: tokenbroker-bigmoe
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bigmoe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch model, self-test, run the BigMoe worker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TB_GATEWAY: ${{ secrets.TB_GATEWAY }}
+          TB_NODE_TOKEN_BMOE: ${{ secrets.TB_NODE_TOKEN_BMOE }}
+          WORKER_RUN_MINUTES: '345'
+        run: bash run-bigmoe.sh

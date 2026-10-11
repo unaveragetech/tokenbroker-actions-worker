@@ -727,7 +727,7 @@ def save_config_pref(key, value):
     """Persist a worker preference (e.g. private_jobs) back to worker-config.json."""
     try:
         path = os.path.join(app_dir(), "worker-config.json")
-        with open(path) as f:
+        with open(path, encoding="utf-8-sig") as f:
             cfg = json.load(f)
         if not isinstance(cfg, dict):
             cfg = {}
@@ -981,6 +981,275 @@ def refresh_cloud_account():
     verify_cloud_account()
 
 
+# --- BigMoeOnEdge runtime (optional) ---------------------------------------
+# Lets a small machine serve Mixture-of-Experts models far bigger than its RAM
+# by streaming the experts each token needs from flash (github.com/Helldez/
+# BigMoeOnEdge, Apache-2.0, built on llama.cpp). It has no HTTP server: its
+# long-running mode is `bmoe-cli --session`, a JSON-lines protocol over
+# stdin/stdout. Models are public names starting with "bmoe-" and are mapped to
+# local GGUF files in worker-config.json ("bigmoe": {...}); the hub only
+# dispatches one to a node that advertises that exact name.
+BMOE_PREFIX = "bmoe-"
+BMOE_CREATE_NO_WINDOW = 0x08000000
+
+
+def is_bigmoe_model(name):
+    return str(name or "").lower().startswith(BMOE_PREFIX)
+
+
+def _bmoe_find_exe(cfg):
+    exe = cfg.get("exe")
+    if exe and os.path.isfile(exe):
+        return exe
+    base = cfg.get("dir") or os.environ.get("BIGMOE_DIR")
+    if not base:
+        return None
+    for sub_dir in ("", os.path.join("build", "cli", "Release"), os.path.join("build", "cli"), "bin"):
+        for n in ("bmoe-cli.exe", "bmoe-cli"):
+            cand = os.path.join(base, sub_dir, n)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def configure_bigmoe(cfg):
+    """Validate the optional "bigmoe" config block and record what this node
+    can actually serve (engine found AND the GGUF present)."""
+    st = {"enabled": False, "models": {}}
+    STATE["bigmoe"] = st
+    if not isinstance(cfg, dict) or not cfg.get("enabled", True) or not cfg.get("models"):
+        return
+    exe = _bmoe_find_exe(cfg)
+    if not exe:
+        print("bigmoe: bmoe-cli not found (set bigmoe.exe or bigmoe.dir) - disabled")
+        return
+    models = {}
+    for name, path in (cfg.get("models") or {}).items():
+        if not is_bigmoe_model(name):
+            print(f"bigmoe: model name '{name}' must start with '{BMOE_PREFIX}' - skipped")
+        elif not os.path.isfile(str(path)):
+            print(f"bigmoe: GGUF for '{name}' not found at {path} - skipped")
+        else:
+            models[name] = str(path)
+    if not models:
+        return
+    cores = os.cpu_count() or 4
+    dll_dir = cfg.get("dll_dir")
+    if not dll_dir:
+        dll_dir = os.path.join(cfg["dir"], "build", "bin", "Release") if cfg.get("dir") else os.path.dirname(exe)
+    st.update(
+        enabled=True,
+        exe=exe,
+        models=models,
+        dll_dir=dll_dir,
+        threads=int(cfg.get("threads") or max(2, cores // 2)),
+        ctx=int(cfg.get("ctx") or 4096),
+        cache_ceil_mb=int(cfg.get("cache_ceil_mb") or 3000),
+        cache_floor_mb=int(cfg.get("cache_floor_mb") or 2048),
+        io_threads=int(cfg.get("io_threads") or 4),
+        idle_unload_s=float(cfg.get("idle_unload_s") or 300),
+        extra_args=[str(a) for a in (cfg.get("extra_args") or [])],
+    )
+    print(f"bigmoe: enabled, serving {', '.join(models)} via {exe}")
+
+
+class BigMoeSession:
+    """One persistent `bmoe-cli --session` process (one model). Requests are
+    serialised - it is a single CPU/IO-bound engine."""
+
+    def __init__(self, model_name, model_path, opts):
+        self.model_name = model_name
+        self.model_path = model_path
+        self.opts = opts
+        self.proc = None
+        self.ready = {}
+        self.pending = {}
+        self.cv = threading.Condition()
+        self.next_id = 1
+        self.last_used = time.time()
+
+    def is_up(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, timeout=180.0):
+        o = self.opts
+        args = [
+            o["exe"], "-m", self.model_path, "--session", "--moe-stream",
+            "--cache-mb", "auto", "--cache-floor-mb", str(o["cache_floor_mb"]),
+            "--cache-ceil-mb", str(o["cache_ceil_mb"]), "--io-threads", str(o["io_threads"]),
+            "-t", str(o["threads"]), "-c", str(o["ctx"]), "--chatml",
+        ] + list(o.get("extra_args") or [])
+        env = dict(os.environ)
+        if sys.platform.startswith("win"):
+            env["PATH"] = o["dll_dir"] + os.pathsep + env.get("PATH", "")
+        else:
+            env["LD_LIBRARY_PATH"] = o["dll_dir"] + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        kw = {}
+        if sys.platform.startswith("win"):
+            kw["creationflags"] = BMOE_CREATE_NO_WINDOW
+        self.proc = subprocess.Popen(
+            args, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", bufsize=1, **kw,
+        )
+        threading.Thread(target=self._read_loop, args=(self.proc,), daemon=True, name="bigmoe-reader").start()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.ready:
+                self.last_used = time.time()
+                return self.ready
+            if self.proc.poll() is not None:
+                raise RuntimeError("bmoe-cli exited before the model finished loading")
+            time.sleep(0.2)
+        self.stop()
+        raise RuntimeError("timed out loading the model")
+
+    def _read_loop(self, proc):
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line.startswith("BMOE_"):
+                continue
+            tag, _, rest = line.partition(" ")
+            try:
+                data = json.loads(rest) if rest else {}
+            except ValueError:
+                data = {}
+            if tag == "BMOE_READY":
+                self.ready = data or {"ok": True}
+            elif tag in ("BMOE_DONE", "BMOE_ERROR"):
+                with self.cv:
+                    self.pending[data.get("id", 0)] = {"tag": tag, **data}
+                    self.cv.notify_all()
+        with self.cv:
+            self.cv.notify_all()
+
+    @staticmethod
+    def _send_to(proc, obj):
+        proc.stdin.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+
+    def generate(self, prompt, n_predict, timeout):
+        rid = self.next_id
+        self.next_id += 1
+        self._send_to(self.proc, {
+            "cmd": "generate", "id": rid, "prompt": prompt,
+            "n_predict": int(n_predict), "think": False, "clear_kv": True,
+        })
+        deadline = time.time() + timeout
+        with self.cv:
+            while rid not in self.pending:
+                if time.time() >= deadline or not self.is_up():
+                    break
+                self.cv.wait(timeout=1.0)
+            res = self.pending.pop(rid, None)
+        if res is None:
+            try:
+                self._send_to(self.proc, {"cmd": "cancel"})
+            except Exception:
+                pass
+            raise RuntimeError("bigmoe generation timed out" if self.is_up() else "bigmoe engine exited mid-job")
+        self.last_used = time.time()
+        if res["tag"] == "BMOE_ERROR":
+            raise RuntimeError(f"bigmoe error: {res.get('msg', 'unknown')}")
+        return res
+
+    def stop(self):
+        proc, self.proc = self.proc, None
+        if not proc:
+            return
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                self._send_to(proc, {"cmd": "close"})
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+_BMOE_SESSION = None
+
+
+def bigmoe_models():
+    st = STATE.get("bigmoe") or {}
+    return list((st.get("models") or {}).keys()) if st.get("enabled") else []
+
+
+def bigmoe_idle_sweep():
+    """Release the engine's RAM/cache once nobody has used it for a while."""
+    global _BMOE_SESSION
+    st = STATE.get("bigmoe") or {}
+    if _BMOE_SESSION and st.get("enabled") and time.time() - _BMOE_SESSION.last_used > st.get("idle_unload_s", 300):
+        _BMOE_SESSION.stop()
+        _BMOE_SESSION = None
+
+
+def bigmoe_render_prompt(messages):
+    """bmoe-cli's session takes one user prompt (it applies the chat template),
+    so system text and earlier turns are folded into that single message."""
+    sys_parts, turns = [], []
+    for m in messages or []:
+        c = m.get("content")
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        c = str(c or "")
+        if m.get("role") == "system":
+            sys_parts.append(c)
+        else:
+            turns.append((m.get("role") or "user", c))
+    if not turns:
+        turns = [("user", "Hello")]
+    if len(turns) == 1 and not sys_parts:
+        return turns[0][1]
+    out = []
+    if sys_parts:
+        out.append("Instructions:\n" + "\n".join(sys_parts))
+    if len(turns) > 1:
+        out.append("Conversation so far:")
+        for role, c in turns[:-1]:
+            out.append(("User: " if role == "user" else "Assistant: ") + c)
+        out.append("Latest message from the user:")
+    out.append(turns[-1][1])
+    return "\n\n".join(out)
+
+
+def run_bigmoe_job(job):
+    global _BMOE_SESSION
+    st = STATE.get("bigmoe") or {}
+    model = job["model"]
+    if job.get("kind", "chat") != "chat":
+        raise ValueError("bigmoe models only serve chat jobs")
+    path = (st.get("models") or {}).get(model) if st.get("enabled") else None
+    if not path:
+        raise RuntimeError(f"model {model} is not installed on this node")
+    payload = job.get("payload") or {}
+    prompt = bigmoe_render_prompt(payload.get("messages"))
+    n_predict = max(16, min(int(payload.get("max_tokens") or 512), 2048))
+    # Fixed context: the engine rejects prompt + generation past n_ctx, so
+    # shrink the generation budget instead of failing a long-ish prompt.
+    n_predict = min(n_predict, st["ctx"] - (len(prompt) // 3 + 32))
+    if n_predict < 16:
+        raise RuntimeError("prompt too long for this node's context window")
+    if _BMOE_SESSION and (not _BMOE_SESSION.is_up() or _BMOE_SESSION.model_name != model):
+        _BMOE_SESSION.stop()
+        _BMOE_SESSION = None
+    if not _BMOE_SESSION:
+        STATE["job_state"] = "loading model"
+        sess = BigMoeSession(model, path, st)
+        sess.start()
+        _BMOE_SESSION = sess
+        STATE["job_state"] = "working"
+    res = _BMOE_SESSION.generate(prompt, n_predict, timeout=min(1800, 120 + n_predict * 2))
+    text = res.get("text") or ""
+    print(
+        f"bigmoe: {res.get('tokens')} tokens @ {res.get('tok_s')} tok/s, "
+        f"prefill {res.get('prefill_s')}s, cache hit {res.get('cache_hit_pct')}%"
+    )
+    if not text.strip():
+        raise RuntimeError("bigmoe produced no output")
+    return {"response": text, "output_tokens": int(res.get("tokens") or 0)}
+
+
 def advertised_models(cloud_enabled, exhausted=False):
     """Models this worker will accept. Cloud-gated models are only offered
     when the worker has Ollama Cloud enabled, the ollama.com session is
@@ -990,9 +1259,9 @@ def advertised_models(cloud_enabled, exhausted=False):
     paywalled = set(STATE["cloud"].get("paywalled") or [])
     models = [m for m in local_models() if m not in paywalled]
     auth_ok = STATE["cloud"].get("auth_ok") is True
-    if cloud_enabled and auth_ok and not exhausted:
-        return models
-    return [m for m in models if not is_cloud_model(m)]
+    if not (cloud_enabled and auth_ok and not exhausted):
+        models = [m for m in models if not is_cloud_model(m)]
+    return models + [m for m in bigmoe_models() if m not in models]
 
 
 def hiro_module():
@@ -1068,6 +1337,8 @@ def run_job(job):
     model = job["model"]
     kind = job.get("kind", "chat")
     payload = job.get("payload") or {}
+    if is_bigmoe_model(model):
+        return run_bigmoe_job(job)
     # Non-Ollama cloud providers (Google AI Studio, Mistral AI Studio, ...) -
     # these never run locally at all (unlike Ollama cloud models, which can
     # at least be attempted through the local proxy), so the ONLY path is
@@ -1376,6 +1647,7 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
             threading.Thread(target=verify_cloud_account, daemon=True).start()
         # Idle-pool eviction sweep: drop system-pulled models unused for more
         # than max_pool_idle_hours so a node never accumulates disk usage.
+        bigmoe_idle_sweep()
         if time.time() - pool_last_sweep > 300:
             pool_last_sweep = time.time()
             evict_idle_pool(STATE.get("max_pool_idle_hours", 2))
@@ -1502,6 +1774,7 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
             job.get("model") not in STATE["models"]
             and not STATE.get("dry_run")
             and not detect_external_provider(job.get("model"))
+            and not is_bigmoe_model(job.get("model"))
         ):
             STATE["job_state"] = "pulling"
             STATE["current_job"] = job["model"]
@@ -1607,7 +1880,7 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
             # happened) AND the Ollama-specific cloud-auth/quota tracking
             # further down (whose success/failure signal is specifically
             # about ollama.com, not some other provider entirely).
-            if detect_external_provider(job.get("model")):
+            if detect_external_provider(job.get("model")) or is_bigmoe_model(job.get("model")):
                 pass
             elif not is_cloud_model(job.get("model")):
                 pool_touch(job["model"])
@@ -2159,7 +2432,7 @@ def main():
     cfg = None
     for candidate in config_candidates:
         if candidate and os.path.exists(candidate):
-            with open(candidate) as f:
+            with open(candidate, encoding="utf-8-sig") as f:  # tolerate a BOM (PowerShell writes one)
                 cfg = json.load(f)
             break
     if cfg and isinstance(cfg, dict):
@@ -2176,6 +2449,7 @@ def main():
         private_jobs = False
     STATE["private_jobs"] = private_jobs
     STATE["dry_run"] = args.dry_run
+    configure_bigmoe(cfg.get("bigmoe"))
     STATE["cloud"]["enabled"] = bool(cfg.get("cloud_enabled", False))
     STATE["cloud"]["quota_per_hour"] = int(cfg.get("cloud_quota_per_hour", 100000) or 100000)
     STATE["cloud"]["remaining"] = STATE["cloud"]["quota_per_hour"]
