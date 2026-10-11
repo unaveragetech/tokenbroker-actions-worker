@@ -35,17 +35,39 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def _hidden_startupinfo():
+    """SW_HIDE startup info so child processes never flash a window."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        return si
+    except Exception:
+        return None
+
+
 def _run(args, **kwargs):
     """subprocess.run that never flashes a console window on Windows.
 
     The worker is a windowed app (PyInstaller --noconsole), but child console
     processes (nvidia-smi, powershell, ollama) would otherwise pop a cmd
-    window on every heartbeat. CREATE_NO_WINDOW keeps everything invisible.
+    window on every heartbeat. CREATE_NO_WINDOW + SW_HIDE keep everything
+    invisible.
+
+    Text-mode captures are decoded as UTF-8 (undecodable bytes replaced):
+    `ollama pull` emits progress glyphs the Windows ANSI codepage can't
+    decode, which otherwise kills the capture reader thread.
     """
+    if kwargs.get("text") or kwargs.get("universal_newlines"):
+        kwargs.setdefault("encoding", "utf-8")
+        kwargs.setdefault("errors", "replace")
     if sys.platform.startswith("win"):
         kwargs.setdefault(
             "creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )
+        kwargs.setdefault("startupinfo", _hidden_startupinfo())
     return subprocess.run(args, **kwargs)
 
 
@@ -55,6 +77,7 @@ def _popen_hidden(args, **kwargs):
         kwargs.setdefault(
             "creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )
+        kwargs.setdefault("startupinfo", _hidden_startupinfo())
     kwargs.setdefault("stdin", subprocess.DEVNULL)
     kwargs.setdefault("stdout", subprocess.PIPE)
     kwargs.setdefault("stderr", subprocess.STDOUT)
@@ -124,6 +147,9 @@ STATE = {
     "last_job": None,  # {id, model, kind, redacted_prompt, started_at, finished_at, latency_ms}
     "last_error": None,
     "private_mode": False,
+    "private_jobs": True,
+    "job_history": [],
+    "_last_tokens": 0,
     "storage_gb": 20,
     "gateway": None,
     "fingerprint": None,
@@ -132,6 +158,10 @@ STATE = {
     "worker_hash": None,
     "worker_verified": None,
     "history": [],
+    # Keys for non-Ollama cloud providers (Google AI Studio, Mistral AI
+    # Studio, ...) synced down from the hub's heartbeat response - see
+    # EXTERNAL_PROVIDERS below and the provider_keys sync in worker_loop.
+    "provider_keys": {},
     "rpm": 0,
     "pool": {},
     "pool_count": 0,
@@ -141,6 +171,13 @@ STATE = {
     "cloud": {
         "enabled": False,
         "auth_ok": None,
+        # An account-wide (or per-node) key synced down from the hub's
+        # heartbeat response - see api_key sync-down below. Used only as a
+        # fallback direct call to ollama.com when this machine's local
+        # `ollama signin` session isn't authenticated (auth_ok is not True):
+        # if signin already works, the existing local-proxy path is used
+        # unchanged, since it needs no key at all.
+        "api_key": None,
         "used_tokens_per_hour": 0,
         "quota_per_hour": 100000,
         "remaining": 100000,
@@ -148,60 +185,97 @@ STATE = {
         "account": None,
         "installed": None,
         "total_tokens": 0,
+        "subscription": None,
+        "paywalled": [],
+        # Set only by a REAL rejection from Ollama (classify_cloud_error ==
+        # 'quota'), never by our own self-imposed hourly pacing budget above.
+        # real_limit_hit_tokens is the empirical answer to "how many tokens
+        # can this account actually generate" - Ollama exposes no API for
+        # it, so this is the only way to ever learn a real number.
+        "real_limit_hit": False,
+        "real_limit_hit_at": None,
+        "real_limit_hit_tokens": None,
+        "real_limit_cleared_at": None,
     },
 }
+
+# After a real quota rejection, stop advertising cloud models for this long
+# before trying again (one probe job). Too short risks repeatedly hammering
+# a still-exhausted account (the automation/ToS risk); too long leaves
+# capacity idle after Ollama's real reset. Ollama's reset cadence is
+# monthly-from-signup and unpublished per-account, so this is a compromise,
+# not a known-correct value.
+CLOUD_LIMIT_RETRY_COOLDOWN_S = 6 * 60 * 60
+
+
+def cloud_real_limit_active():
+    """True while a real (not self-imposed) quota rejection is still in its
+    cooldown window - advertised_models() uses this to stop offering cloud
+    models until one probe job is allowed through again."""
+    c = STATE["cloud"]
+    if not c.get("real_limit_hit") or not c.get("real_limit_hit_at"):
+        return False
+    return (time.time() - c["real_limit_hit_at"]) < CLOUD_LIMIT_RETRY_COOLDOWN_S
 
 PAUSE_EVENT = threading.Event()
 STOP_EVENT = threading.Event()
 
-WINDOWS_HW_SCRIPT = r"""
-$ErrorActionPreference='SilentlyContinue'
-$cs=Get-CimInstance Win32_ComputerSystem
-$bios=Get-CimInstance Win32_BIOS
-$cpu=Get-CimInstance Win32_Processor
-$board=Get-CimInstance Win32_BaseBoard
-$disks=@(Get-CimInstance Win32_DiskDrive)
-$macs=@(Get-NetAdapter -Physical | Select-Object -ExpandProperty MacAddress)
-$guid=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid
-[pscustomobject]@{
-  manufacturer=$cs.Manufacturer; model=$cs.Model; hypervisor=$cs.HypervisorPresent
-  biosMan=$bios.Manufacturer; biosSer=$bios.SerialNumber
-  cpu=$cpu.Name; cpuId=$cpu.ProcessorId
-  cores=($cpu | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
-  ramGb=[math]::Round($cs.TotalPhysicalMemory/1GB,1)
-  boardSer=$board.SerialNumber; guid=$guid
-  macs=($macs -join ','); disks=(($disks | ForEach-Object Model) -join ',')
-  diskSers=(($disks | ForEach-Object SerialNumber) -join ',')
-} | ConvertTo-Json -Compress
-"""
-
-
-def powershell_json(script):
+def _win_hw_python():
+    """Pure-Python Windows hardware gatherer - no PowerShell, no popups."""
+    info = {
+        "manufacturer": None, "model": None, "hypervisor": None,
+        "biosMan": None, "biosSer": None, "cpu": platform.processor(),
+        "cpuId": None, "cores": os.cpu_count() or 0,
+        "ramGb": round_ram(), "boardSer": None, "guid": None,
+        "macs": str(uuid.getnode()), "disks": "", "diskSers": "",
+    }
     try:
-        out = _run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=25,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            return json.loads(out.stdout.strip().splitlines()[-1])
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as k:
+                info["guid"] = winreg.QueryValueEx(k, "MachineGuid")[0]
+        except Exception:
+            pass
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                info["cpu"] = winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
+                info["cpuId"] = winreg.QueryValueEx(k, "Identifier")[0].strip()
+        except Exception:
+            pass
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\BIOS") as k:
+                info["biosMan"] = winreg.QueryValueEx(k, "BIOSVendor")[0]
+                info["biosSer"] = winreg.QueryValueEx(k, "BIOSSerialNumber")[0]
+                info["boardSer"] = winreg.QueryValueEx(k, "SystemSerialNumber")[0]
+                info["manufacturer"] = winreg.QueryValueEx(k, "SystemManufacturer")[0]
+                info["model"] = winreg.QueryValueEx(k, "SystemProductName")[0]
+        except Exception:
+            pass
     except Exception:
         pass
-    return None
-
-
-def _read(path):
     try:
-        with open(path) as f:
-            return f.read().strip()
+        import psutil
+        macs = []
+        for _name, addrs in psutil.net_if_addrs().items():
+            for a in addrs:
+                if getattr(psutil, "AF_LINK", None) is not None and a.family == psutil.AF_LINK and a.address and a.address.lower() != "00:00:00:00:00:00":
+                    macs.append(a.address)
+        info["macs"] = ",".join(dict.fromkeys(macs))[:400]
+        disks = []
+        try:
+            for part in psutil.disk_partitions(all=True):
+                disks.append(part.device)
+        except Exception:
+            pass
+        info["disks"] = ",".join(disks)[:400]
     except Exception:
-        return ""
+        pass
+    return info
 
 
 def gather_hw():
     if sys.platform.startswith("win"):
-        info = powershell_json(WINDOWS_HW_SCRIPT)
+        info = _win_hw_python()
         if info:
             return info
         return {
@@ -241,19 +315,26 @@ def gather_hw():
 def round_ram():
     try:
         if sys.platform.startswith("win"):
-            out = _run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,1)",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if out.returncode == 0 and out.stdout.strip():
-                return float(out.stdout.strip())
+            try:
+                import ctypes
+                class _MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                m = _MEMORYSTATUSEX()
+                m.dwLength = ctypes.sizeof(m)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                    return round(m.ullTotalPhys / (1024 ** 3), 1)
+            except Exception:
+                pass
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemTotal"):
@@ -326,6 +407,19 @@ def vm_detection(info):
     return {"score": round(min(1.0, score), 2), "reasons": reasons[:6]}
 
 
+class HttpJsonError(Exception):
+    """HTTPError with the status code + response body preserved, so callers
+    can tell a real Ollama Cloud quota/rate-limit rejection apart from an
+    auth failure or an unrelated error. str(err) still reads like a normal
+    error message, so every existing `except Exception` / `str(err)` call
+    site keeps working unchanged."""
+
+    def __init__(self, status, body, url):
+        self.status = status
+        self.body = body or ""
+        super().__init__(f"HTTP {status} from {url}: {self.body[:500]}")
+
+
 def http_json(url, payload=None, method="POST", timeout=120):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
@@ -339,8 +433,102 @@ def http_json(url, payload=None, method="POST", timeout=120):
             "User-Agent": "TokenBrokerWorker/1.0",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors="replace")
+        except Exception:
+            pass
+        raise HttpJsonError(e.code, body, url) from e
+
+
+def call_ollama_cloud_direct(api_key, model, messages, max_tokens=None, timeout=120):
+    """Direct HTTPS call to Ollama's real cloud API, bearer-token
+    authenticated - the same wire contract public/mobile-worker.html and the
+    Android/iOS workers already use. Only reached when this machine has no
+    working local `ollama signin` session but the hub synced down a key (see
+    the api_key sync-down in worker_loop's heartbeat handling) - the normal,
+    preferred path is still the local Ollama proxy below, which needs no key
+    at all once actually signed in."""
+    body = {"model": model, "messages": messages, "stream": False}
+    if max_tokens:
+        body["max_tokens"] = max_tokens
+    req = urllib.request.Request(
+        "https://ollama.com/api/chat",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "TokenBrokerWorker/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        resp_body = ""
+        try:
+            resp_body = e.read().decode(errors="replace")
+        except Exception:
+            pass
+        if e.code in (401, 403):
+            # HttpJsonError carries .status, so classify_cloud_error above
+            # correctly classifies this as 'auth' from the status code alone.
+            # The leading message text also matters on its own: the hub's
+            # completeJob() flips this node's cloud_auth_ok to 0 whenever it
+            # sees the exact phrase "Ollama rejected the API key" (see
+            # src/compute.js), the same wording the Android/iOS/JS workers
+            # already use for this identical failure. resp_body is appended
+            # because a bare status code alone is undiagnosable when a key
+            # verifies as genuinely valid from elsewhere but keeps getting
+            # rejected only from one machine/network - cf-ray in the headers
+            # would confirm Cloudflare's edge blocked it before Ollama's own
+            # auth check ever ran.
+            cf_ray = e.headers.get("cf-ray") if getattr(e, "headers", None) else None
+            suffix = " ".join(filter(None, [f"[cf-ray={cf_ray}]" if cf_ray else None, resp_body[:300] or None]))
+            raise HttpJsonError(e.code, f"Ollama rejected the API key - invalid or revoked {suffix}".strip(), "https://ollama.com/api/chat") from e
+        raise HttpJsonError(e.code, resp_body, "https://ollama.com/api/chat") from e
+    message = result.get("message") or {}
+    content = message.get("content") or message.get("thinking") or ""
+    output_tokens = int(result.get("eval_count") or 0)
+    return content, output_tokens
+
+
+_CLOUD_QUOTA_PATTERN = re.compile(
+    r"quota|rate.?limit|too many requests|insufficient.*(balance|credit)|credit.*(exhaust|insufficient)",
+    re.I,
+)
+_CLOUD_AUTH_PATTERN = re.compile(
+    r"unauthorized|not signed in|sign.?in required|authentication|invalid.*(token|api.?key)|forbidden",
+    re.I,
+)
+
+
+def classify_cloud_error(err):
+    """Distinguish a REAL Ollama Cloud rejection (429, or a 402/error body
+    that actually talks about quota/credits) from an auth failure or an
+    unrelated error (network blip, model missing, etc). Returns 'quota',
+    'auth', or None. This is the only place that observes Ollama's actual
+    enforcement - Ollama publishes no API for remaining balance, so this is
+    the sole way to learn a real account's real ceiling (see
+    docs/cloud-models.md)."""
+    status = getattr(err, "status", None)
+    body = getattr(err, "body", "") or str(err)
+    if _CLOUD_AUTH_PATTERN.search(body) and status in (401, 403):
+        return "auth"
+    if status == 429:
+        return "quota"
+    if status == 402 and not _CLOUD_AUTH_PATTERN.search(body):
+        return "quota"
+    if _CLOUD_QUOTA_PATTERN.search(body):
+        return "quota"
+    if status in (401, 403) or _CLOUD_AUTH_PATTERN.search(body):
+        return "auth"
+    return None
 
 
 def detect_gpu():
@@ -411,6 +599,64 @@ def is_cloud_model(name):
     return ":cloud" in n or n.endswith("-cloud")
 
 
+# Non-Ollama cloud providers (Google AI Studio, Mistral AI Studio, ...) -
+# mirrors src/externalProviders.js on the hub exactly (same provider ids,
+# same URLs, same model-prefix routing) so a job dispatched there is
+# executed here the same way. Both providers expose a genuine OpenAI-
+# compatible chat-completions endpoint (confirmed against their own docs),
+# so one generic caller (call_external_provider below) covers both - no
+# provider-specific request/response parsing needed.
+EXTERNAL_PROVIDERS = {
+    "google": {"url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "prefix": re.compile(r"^gemini-", re.I)},
+    "mistral": {"url": "https://api.mistral.ai/v1/chat/completions", "prefix": re.compile(r"^(mistral|codestral|pixtral|ministral)-", re.I)},
+}
+
+
+def detect_external_provider(model):
+    name = str(model or "")
+    for provider_id, info in EXTERNAL_PROVIDERS.items():
+        if info["prefix"].search(name):
+            return provider_id
+    return None
+
+
+def call_external_provider(provider_id, api_key, model, messages, max_tokens=None, timeout=120):
+    """Generic OpenAI-compatible chat-completions call, shared by every
+    provider in EXTERNAL_PROVIDERS - see the registry comment for why one
+    implementation covers all of them."""
+    url = EXTERNAL_PROVIDERS[provider_id]["url"]
+    body = {"model": model, "messages": messages}
+    if max_tokens:
+        body["max_tokens"] = max_tokens
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "TokenBrokerWorker/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        resp_body = ""
+        try:
+            resp_body = e.read().decode(errors="replace")
+        except Exception:
+            pass
+        if e.code in (401, 403):
+            raise HttpJsonError(e.code, f"{provider_id} rejected the API key - {resp_body[:300]}", url) from e
+        raise HttpJsonError(e.code, resp_body, url) from e
+    choice = (result.get("choices") or [{}])[0]
+    content = (choice.get("message") or {}).get("content") or ""
+    usage = result.get("usage") or {}
+    tokens = int(usage.get("completion_tokens") or usage.get("total_tokens") or 0)
+    return content, tokens
+
+
 def ollama_bin():
     """Locate the Ollama CLI (it is not always on PATH, especially Windows)."""
     if sys.platform.startswith("win"):
@@ -431,13 +677,25 @@ def ollama_bin():
 
 
 def ollama_account_from_signin(output):
-    """Extract the signed-in ollama.com username from `ollama signin` output."""
-    m = re.search(r"already signed in as user '([^']+)'", output or "")
-    if m:
-        return m.group(1)
-    m = re.search(r"(?:signed|logged) in as\s+([^\s']+)", output or "", re.IGNORECASE)
-    if m:
-        return m.group(1)
+    """Extract the signed-in ollama.com username from `ollama signin` output.
+
+    Handles the formats seen across Ollama CLI versions:
+      - already signed in as user 'name'
+      - already signed in as 'name'
+      - You are already signed in as name
+      - signed in as 'name' / logged in as name
+    """
+    text = output or ""
+    for pat in (
+        r"already signed in as user ['\"]?([^'\"]+)",
+        r"already signed in as ['\"]?([^'\"]+)",
+        r"(?:signed|logged) in as (?:user )?['\"]?([^'\"]+?)['\"]?\s*$",
+    ):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            name = m.group(1).strip().rstrip(".'\"")
+            if name:
+                return name
     return None
 
 
@@ -450,6 +708,21 @@ def cloud_state_path():
     return os.path.join(app_dir(), "worker-cloud.json")
 
 
+def save_config_pref(key, value):
+    """Persist a worker preference (e.g. private_jobs) back to worker-config.json."""
+    try:
+        path = os.path.join(app_dir(), "worker-config.json")
+        with open(path) as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        cfg[key] = value
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
 def load_cloud_state():
     """Restore the last verified ollama.com account + cloud toggle. Ollama's
     own session lives in the running Ollama server; this file lets the worker
@@ -459,7 +732,10 @@ def load_cloud_state():
             data = json.load(f)
         if not isinstance(data, dict):
             return
-        for key in ("account", "login", "auth_ok", "verified_at", "enabled"):
+        for key in (
+            "account", "login", "auth_ok", "verified_at", "enabled", "subscription", "paywalled",
+            "real_limit_hit", "real_limit_hit_at", "real_limit_hit_tokens", "real_limit_cleared_at",
+        ):
             if key in data:
                 STATE["cloud"][key] = data[key]
     except Exception:
@@ -476,6 +752,12 @@ def save_cloud_state():
                     "auth_ok": STATE["cloud"].get("auth_ok"),
                     "verified_at": STATE["cloud"].get("verified_at"),
                     "enabled": bool(STATE["cloud"].get("enabled")),
+                    "subscription": STATE["cloud"].get("subscription"),
+                    "paywalled": STATE["cloud"].get("paywalled") or [],
+                    "real_limit_hit": STATE["cloud"].get("real_limit_hit"),
+                    "real_limit_hit_at": STATE["cloud"].get("real_limit_hit_at"),
+                    "real_limit_hit_tokens": STATE["cloud"].get("real_limit_hit_tokens"),
+                    "real_limit_cleared_at": STATE["cloud"].get("real_limit_cleared_at"),
                 },
                 f,
                 indent=2,
@@ -636,34 +918,45 @@ def evict_idle_pool(max_idle_hours):
 def verify_cloud_account():
     """Non-interactive ollama.com session check. `ollama signin` prints
     "already signed in as user 'X'" and exits immediately when the session is
-    valid; when signed out it waits for a browser flow, so a short timeout
-    means signed out. Updates STATE and persists it so the worker remembers
-    the logged-in user and never advertises cloud models it cannot serve."""
+    valid; when signed out it waits for a browser flow, so a timeout means
+    signed out. Older Ollama builds use `login` instead of `signin`, so we
+    fall back before declaring the session lapsed. Ambiguous check failures
+    (timeout, unrecognized output) never hard-flip a previously-good session
+    to 'signed out' - they mark auth as unknown so a later re-verify can
+    restore it without a manual sign-in."""
     with CLOUD_LOCK:
-        try:
-            bin_path = ollama_bin()
+        confirmed = False
+        acct = None
+        bin_path = ollama_bin()
+        for cmd in ("signin", "login"):
             if not bin_path:
-                STATE["cloud"]["auth_ok"] = False
-                STATE["cloud"]["login"] = False
-                STATE["cloud"]["verified_at"] = time.time()
-                save_cloud_state()
-                return
-            proc = _run(
-                [bin_path, "signin"], capture_output=True, text=True, timeout=8
-            )
-            output = (proc.stdout or "") + (proc.stderr or "")
-            acct = ollama_account_from_signin(output)
-            if proc.returncode == 0 and acct:
-                STATE["cloud"]["account"] = acct
-                STATE["cloud"]["login"] = True
-                STATE["cloud"]["auth_ok"] = True
-                STATE["cloud"]["verified_at"] = time.time()
-                save_cloud_state()
-                return
-        except Exception:
-            pass
-        STATE["cloud"]["auth_ok"] = False
-        STATE["cloud"]["login"] = False
+                break
+            try:
+                proc = _run([bin_path, cmd], capture_output=True, text=True, timeout=20)
+                output = (proc.stdout or "") + (proc.stderr or "")
+                parsed = ollama_account_from_signin(output)
+                if proc.returncode == 0 and parsed:
+                    confirmed = True
+                    acct = parsed
+                    break
+            except Exception:
+                continue
+        if confirmed and acct:
+            STATE["cloud"]["account"] = acct
+            STATE["cloud"]["login"] = True
+            STATE["cloud"]["auth_ok"] = True
+            STATE["cloud"]["verified_at"] = time.time()
+            save_cloud_state()
+            return
+        # Couldn't confirm the session. If it was previously good, keep the
+        # account and mark auth unknown (not signed out) so the next re-verify
+        # restores it; only a definitive failure flips login to False.
+        was_ok = STATE["cloud"].get("auth_ok") is True
+        if not bin_path:
+            was_ok = False
+        STATE["cloud"]["auth_ok"] = None if was_ok else False
+        if not was_ok:
+            STATE["cloud"]["login"] = False
         STATE["cloud"]["verified_at"] = time.time()
         save_cloud_state()
 
@@ -679,7 +972,8 @@ def advertised_models(cloud_enabled, exhausted=False):
     verified (auth_ok True), AND quota remains; an exhausted or signed-out
     node stops advertising cloud models entirely so the hub never assigns a
     cloud job it cannot run."""
-    models = local_models()
+    paywalled = set(STATE["cloud"].get("paywalled") or [])
+    models = [m for m in local_models() if m not in paywalled]
     auth_ok = STATE["cloud"].get("auth_ok") is True
     if cloud_enabled and auth_ok and not exhausted:
         return models
@@ -750,9 +1044,58 @@ def job_preview(job):
 
 
 def run_job(job):
+    if STATE.get("dry_run"):
+        # Sleep past the duration quality gate, then return a varied answer so
+        # the hub's anti-exploit checks (min duration, throughput, diversity)
+        # accept the dry-run completion.
+        time.sleep(3.5)
+        return {"response": "Dry-run private job response from the real TokenBroker worker. The hub encoded the prompt as a glyph, the worker decoded it in memory, produced this answer, and returned an encoded glyph. Everything completed end to end without touching disk.", "output_tokens": 200}
     model = job["model"]
     kind = job.get("kind", "chat")
     payload = job.get("payload") or {}
+    # Non-Ollama cloud providers (Google AI Studio, Mistral AI Studio, ...) -
+    # these never run locally at all (unlike Ollama cloud models, which can
+    # at least be attempted through the local proxy), so the ONLY path is
+    # this direct call using a synced-down key. The hub only ever dispatches
+    # one of these here when it already confirmed this account holds a key
+    # for that exact provider (see jobTier in src/compute.js), so a missing
+    # key at this point would mean the key was removed after the job was
+    # already assigned - rare, but handled below rather than assumed away.
+    external_provider = detect_external_provider(model) if kind == "chat" else None
+    if external_provider:
+        api_key = STATE["provider_keys"].get(external_provider)
+        if not api_key:
+            raise RuntimeError(f"no {external_provider} API key configured on this worker")
+        content, output_tokens = call_external_provider(
+            external_provider,
+            api_key,
+            model,
+            payload.get("messages") or [{"role": "user", "content": "Hello"}],
+            max_tokens=payload.get("max_tokens"),
+        )
+        return {"response": content, "output_tokens": output_tokens}
+    # Fallback path: a cloud-tagged job on a machine with no working local
+    # `ollama signin` session, but a key synced down from the hub (account-
+    # wide, set on the Compute tab, or per-node). The normal local-proxy path
+    # below is preferred whenever signin already works, since it needs no key
+    # at all - this only ever activates as a substitute for a real signin.
+    if (
+        kind == "chat"
+        and is_cloud_model(model)
+        and STATE["cloud"].get("auth_ok") is not True
+        and STATE["cloud"].get("api_key")
+    ):
+        content, output_tokens = call_ollama_cloud_direct(
+            STATE["cloud"]["api_key"],
+            model,
+            payload.get("messages") or [{"role": "user", "content": "Hello"}],
+            max_tokens=payload.get("max_tokens"),
+        )
+        # Flagged so the caller doesn't infer "local signin must be working"
+        # from this success (see the auth_ok=True line after a cloud job
+        # completes) - that would wrongly switch future jobs back to the
+        # local proxy path, which still isn't actually signed in.
+        return {"response": content, "output_tokens": output_tokens, "cloud_via_direct_key": True}
     if kind == "chat":
         body = {
             "model": model,
@@ -1005,8 +1348,10 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
         )
         cloud_exhausted = bool(
             STATE["cloud"].get("enabled", False)
-            and STATE["cloud"].get("remaining", 0) <= 0
-            and cloud_used > 0
+            and (
+                (STATE["cloud"].get("remaining", 0) <= 0 and cloud_used > 0)
+                or cloud_real_limit_active()
+            )
         )
         # Re-verify the ollama.com session every 10 minutes so a lapsed login
         # is detected promptly and cloud models stop being advertised (and
@@ -1033,8 +1378,10 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
                 "t": time.strftime("%H:%M"),
                 "rpm": STATE["rpm"],
                 "online": STATE["status"] == "online",
+                "tokens": STATE["tokens"] - STATE.get("_last_tokens", 0),
             }
         ])[-40:]
+        STATE["_last_tokens"] = STATE["tokens"]
 
         if PAUSE_EVENT.is_set():
             STATE["job_state"] = "paused"
@@ -1058,6 +1405,7 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
                     # Report real free space (capped at the configured budget)
                     # so the hub never assigns a pull the disk cannot hold.
                     "storage_gb": round(min(STATE["storage_gb"], free_storage_gb()), 1),
+                    "private_jobs": STATE.get("private_jobs", True),
                 },
                 timeout=30,
             )
@@ -1074,6 +1422,23 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
                 STATE["worker_verified"] = registered == STATE["worker_hash"]
             else:
                 STATE["worker_verified"] = None
+            # A key set on the dashboard (account-wide, or per-node) rides
+            # back on this node's own heartbeat response - the same
+            # sync-down path the mobile/Android/iOS workers already use.
+            # Only ever CONSUMED as a fallback (see run_job) when this
+            # machine's own `ollama signin` isn't authenticated; never
+            # required or used when local signin already works.
+            synced_key = hb.get("node", {}).get("cloud_api_key")
+            if synced_key:
+                STATE["cloud"]["api_key"] = synced_key
+            # Non-Ollama provider keys (Google AI Studio, Mistral AI Studio,
+            # ...) - a plain top-level field on the heartbeat response
+            # (unlike cloud_api_key, which lives under "node" for historical
+            # reasons), always present as an object (possibly empty) so
+            # "checked, nothing configured" is distinguishable from a
+            # response that omitted the field entirely.
+            if isinstance(hb.get("provider_keys"), dict):
+                STATE["provider_keys"] = hb["provider_keys"]
             STATE["job_state"] = "idle"
             print(f"[{time.strftime('%H:%M:%S')}] heartbeat ok")
         except Exception as err:
@@ -1090,7 +1455,7 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
                 {
                     "token": token,
                     "models": advertised_models(cloud_enabled, cloud_exhausted),
-                    "visibility": "all" if private_jobs else "pub",
+                    "visibility": "all" if STATE.get("private_jobs", private_jobs) else "pub",
                 },
                 timeout=30,
             )
@@ -1113,7 +1478,16 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
         # On-demand pulls: the hub can assign a catalog model this node does
         # not have yet (it only does so when the node has disk space for it).
         # Cloud models pull almost instantly; local models take a while.
-        if job.get("model") not in STATE["models"]:
+        # External-provider models (Google AI Studio, Mistral AI Studio, ...)
+        # never exist in `ollama list` and never will - they're served over
+        # HTTP with a synced-down API key (see run_job's external_provider
+        # branch), so `ollama pull` would always fail for them and must
+        # never be attempted.
+        if (
+            job.get("model") not in STATE["models"]
+            and not STATE.get("dry_run")
+            and not detect_external_provider(job.get("model"))
+        ):
             STATE["job_state"] = "pulling"
             STATE["current_job"] = job["model"]
             STATE["last_error"] = f"Pulling model {job['model']}..."
@@ -1212,12 +1586,33 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
             STATE["credits"] += done.get("credits", 0)
             STATE["credits_tier"] = done.get("tier") or STATE["credits_tier"]
             completion_times.append(time.time())
-            if not is_cloud_model(job.get("model")):
+            # A non-Ollama provider model (Gemini, Mistral, ...) never
+            # touches local storage at all, so it must skip BOTH the local
+            # pool bookkeeping below (which assumes an `ollama pull`
+            # happened) AND the Ollama-specific cloud-auth/quota tracking
+            # further down (whose success/failure signal is specifically
+            # about ollama.com, not some other provider entirely).
+            if detect_external_provider(job.get("model")):
+                pass
+            elif not is_cloud_model(job.get("model")):
                 pool_touch(job["model"])
             if is_cloud_model(job.get("model")):
                 cloud_usage.append((time.time(), result["output_tokens"]))
-                STATE["cloud"]["auth_ok"] = True
+                # A success via the direct-key fallback proves nothing about
+                # local `ollama signin` - only a real local-proxy success
+                # does. Leaving auth_ok alone here keeps the fallback active
+                # for the next job too, instead of wrongly switching back to
+                # a local session that was never actually signed in.
+                if not result.get("cloud_via_direct_key"):
+                    STATE["cloud"]["auth_ok"] = True
                 STATE["cloud"]["total_tokens"] += result["output_tokens"]
+                if STATE["cloud"].get("real_limit_hit"):
+                    # A cloud job just succeeded, so the earlier real
+                    # rejection has cleared (Ollama's monthly reset, or it
+                    # was transient) - resume advertising cloud models.
+                    STATE["cloud"]["real_limit_hit"] = False
+                    STATE["cloud"]["real_limit_cleared_at"] = time.time()
+                    save_cloud_state()
                 threading.Thread(target=refresh_cloud_account, daemon=True).start()
             STATE["last_job"].update(
                 {
@@ -1232,14 +1627,46 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
                 f"completed job {job['id']} - {result['output_tokens']} tokens, "
                 f"+{done.get('credits', 0)} {done.get('tier') or 'basic'} credits"
             )
+            STATE["job_history"] = (STATE.get("job_history") or []) + [{
+                "t": time.strftime("%H:%M:%S"),
+                "model": job["model"],
+                "tokens": result["output_tokens"],
+                "credits": done.get("credits", 0),
+                "latency_ms": int((time.time() - started) * 1000),
+                "ok": True,
+            }]
+            STATE["job_history"] = STATE["job_history"][-60:]
         except Exception as err:
             STATE["jobs_failed"] += 1
             STATE["last_error"] = str(err)
             if is_cloud_model(job.get("model")):
-                STATE["cloud"]["auth_ok"] = False
-                # The failure may be a lapsed login; check immediately so the
-                # node stops (or resumes) advertising cloud models correctly.
-                threading.Thread(target=verify_cloud_account, daemon=True).start()
+                error_kind = classify_cloud_error(err)
+                if error_kind == "quota":
+                    # A REAL rejection from Ollama (429, or a 402/error body
+                    # that actually mentions quota/credits) - not our own
+                    # self-imposed hourly pacing budget. Record the exact
+                    # token count this account produced before hitting it
+                    # (the only way to ever learn a real number, since
+                    # Ollama exposes no balance API) and stop advertising
+                    # cloud models until the retry cooldown allows a probe.
+                    if not STATE["cloud"].get("real_limit_hit"):
+                        STATE["cloud"]["real_limit_hit"] = True
+                        STATE["cloud"]["real_limit_hit_at"] = time.time()
+                        STATE["cloud"]["real_limit_hit_tokens"] = STATE["cloud"].get("total_tokens", 0)
+                        save_cloud_state()
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] REAL cloud limit hit after "
+                            f"{STATE['cloud']['real_limit_hit_tokens']} total tokens: {err}"
+                        )
+                    # A real quota rejection is not an auth problem - leave
+                    # auth_ok alone so the dashboard doesn't misreport
+                    # "signed out" for what is actually "signed in, capped".
+                else:
+                    STATE["cloud"]["auth_ok"] = False
+                    # Unclassified (or genuinely auth) failure: the login may
+                    # have lapsed; check immediately so the node stops (or
+                    # resumes) advertising cloud models correctly.
+                    threading.Thread(target=verify_cloud_account, daemon=True).start()
             STATE["last_job"]["finished_at"] = time.strftime("%H:%M:%S")
             try:
                 http_json(
@@ -1250,6 +1677,21 @@ def worker_loop(gateway, token, interval, hw_payload, private_jobs=True):
             except Exception:
                 pass
             print(f"job {job['id']} failed: {err}")
+            if "402" in str(err) or "Payment Required" in str(err):
+                pw = list(STATE["cloud"].get("paywalled") or [])
+                if job.get("model") and job["model"] not in pw:
+                    pw.append(job["model"])
+                    STATE["cloud"]["paywalled"] = pw
+                    save_cloud_state()
+            STATE["job_history"] = (STATE.get("job_history") or []) + [{
+                "t": time.strftime("%H:%M:%S"),
+                "model": job.get("model", ""),
+                "tokens": 0,
+                "credits": 0,
+                "latency_ms": int((time.time() - started) * 1000),
+                "ok": False,
+            }]
+            STATE["job_history"] = STATE["job_history"][-60:]
         if STATE.get("evict_after_job", True):
             _after_job_cleanup(job.get("model"))
         STATE["job_state"] = "idle"
@@ -1302,37 +1744,113 @@ def start_tray(root, ui, build_menu):
 
 
 def run_ui(stats_url):
-    """Visible worker window: status, hardware, earnings, and controls."""
+    """Visible worker window: live status, per-job clarity, earnings, and controls."""
     import queue
     import tkinter as tk
     import webbrowser
+    from tkinter import ttk, messagebox
+
+    BG = "#0b0e14"
+    CARD = "#141925"
+    BORDER = "#232a3a"
+    TEXT = "#dbe2ef"
+    MUTED = "#8b96ab"
+    ACCENT = "#4f8cff"
+    GOOD = "#38d39f"
+    WARN = "#ffb454"
+    BAD = "#ff5c72"
 
     root = tk.Tk()
     root.title("TokenBroker Worker")
-    root.geometry("430x540")
-    root.configure(bg="#0f1115")
+    root.geometry("480x720")
+    root.configure(bg=BG)
+    root.minsize(450, 640)
 
-    status = tk.Label(root, text="Starting...", font=("Segoe UI", 17, "bold"), bg="#0f1115", fg="#fbbf24")
-    status.pack(pady=(18, 2))
-    sub = tk.Label(root, text="Opaque compute node - prompts and outputs stay hidden.", bg="#0f1115", fg="#9ca3af", font=("Segoe UI", 9))
+    header = tk.Frame(root, bg=BG)
+    header.pack(fill="x", padx=16, pady=(14, 2))
+    tk.Label(header, text="TokenBroker", font=("Segoe UI", 15, "bold"), bg=BG, fg=TEXT).pack(side="left")
+    tk.Label(header, text="WORKER", font=("Segoe UI", 10, "bold"), bg=BG, fg=ACCENT).pack(side="left", padx=(6, 0))
+    status = tk.Label(root, text="Starting...", font=("Segoe UI", 16, "bold"), bg=BG, fg=WARN)
+    status.pack(pady=(6, 0))
+    sub = tk.Label(root, text="Opaque compute node - prompts and outputs stay hidden.", bg=BG, fg=MUTED, font=("Segoe UI", 9))
     sub.pack(pady=(0, 8))
-    info = tk.Label(root, text="", justify="left", anchor="w", bg="#0f1115", fg="#e5e7eb", font=("Consolas", 10))
-    info.pack(fill="x", padx=20, pady=6)
-    chart = tk.Canvas(root, width=390, height=130, bg="#161922", highlightthickness=0)
-    chart.pack(fill="x", padx=20, pady=4)
-    last = tk.Label(root, text="", justify="left", anchor="w", bg="#0f1115", fg="#9ca3af", font=("Consolas", 9), wraplength=390)
-    last.pack(fill="x", padx=20, pady=4)
-    buttons = tk.Frame(root, bg="#0f1115")
-    buttons.pack(pady=10)
+
+    def card(parent, title):
+        f = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        tk.Label(f, text=title, bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", padx=8, pady=(6, 0))
+        val = tk.Label(f, text="0", bg=CARD, fg=TEXT, font=("Segoe UI", 13, "bold"))
+        val.pack(anchor="w", padx=8, pady=(0, 6))
+        return f, val
+
+    r1 = tk.Frame(root, bg=BG); r1.pack(fill="x", padx=16, pady=4)
+    r2 = tk.Frame(root, bg=BG); r2.pack(fill="x", padx=16, pady=4)
+    for row in (r1, r2):
+        for i in range(3):
+            row.grid_columnconfigure(i, weight=1)
+    jobs_card, jobs_val = card(r1, "JOBS")
+    tok_card, tok_val = card(r1, "TOKENS")
+    cred_card, cred_val = card(r1, "CREDITS")
+    rpm_card, rpm_val = card(r2, "REQ/MIN")
+    up_card, up_val = card(r2, "UPTIME")
+    cloud_card, cloud_val = card(r2, "CLOUD")
+    jobs_card.grid(row=0, column=0, sticky="nsew", padx=3)
+    tok_card.grid(row=0, column=1, sticky="nsew", padx=3)
+    cred_card.grid(row=0, column=2, sticky="nsew", padx=3)
+    rpm_card.grid(row=0, column=0, sticky="nsew", padx=3)
+    up_card.grid(row=0, column=1, sticky="nsew", padx=3)
+    cloud_card.grid(row=0, column=2, sticky="nsew", padx=3)
+
+    info = tk.Label(root, text="", justify="left", anchor="w", bg=BG, fg=TEXT, font=("Consolas", 9))
+    info.pack(fill="x", padx=18, pady=(6, 2))
+
+    chart = tk.Canvas(root, height=140, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+    chart.pack(fill="x", padx=16, pady=4)
+
+    tk.Label(root, text="Recent jobs", bg=BG, fg=MUTED, font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=18, pady=(6, 0))
+    cols = ("t", "model", "tokens", "credits", "lat", "result")
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT, borderwidth=0, rowheight=20)
+    style.configure("Treeview.Heading", background="#0f1420", foreground=MUTED, borderwidth=0, font=("Segoe UI", 8, "bold"))
+    tree = ttk.Treeview(root, columns=cols, show="headings", height=6, style="Treeview")
+    for c, txt, w in (("t", "Time", 50), ("model", "Model", 160), ("tokens", "Tok", 44), ("credits", "Cred", 46), ("lat", "ms", 42), ("result", "", 62)):
+        tree.heading(c, text=txt)
+        tree.column(c, width=w, anchor="w" if c in ("t", "model") else "e", stretch=(c == "model"))
+    tree.pack(fill="x", padx=16, pady=4)
+
+    last = tk.Label(root, text="", justify="left", anchor="w", bg=BG, fg=WARN, font=("Consolas", 9), wraplength=448)
+    last.pack(fill="x", padx=18, pady=4)
+
+    br1 = tk.Frame(root, bg=BG); br1.pack(fill="x", padx=16, pady=(8, 0))
+    br2 = tk.Frame(root, bg=BG); br2.pack(fill="x", padx=16, pady=(6, 14))
+    for row in (br1, br2):
+        for i in range(4):
+            row.grid_columnconfigure(i, weight=1)
+
+    def mkbtn(parent, text, cmd, col, row, fg=TEXT, bg="#1a2233"):
+        b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg, relief="flat",
+                      font=("Segoe UI", 9), activebackground=bg, activeforeground=fg, cursor="hand2")
+        b.grid(row=row, column=col, sticky="ew", padx=3, pady=2)
+        return b
 
     ui = {"icon": None}
     ui_commands = queue.Queue()
 
     def ui_thread_safe(fn):
-        """Post a UI action from another thread onto the tkinter main loop."""
         ui_commands.put(fn)
 
     def open_details():
+        """Open the folder the worker is installed from (config, logs, uninstaller)."""
+        target = app_dir()
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(target)
+            else:
+                webbrowser.open("file://" + target)
+        except Exception as err:
+            STATE["last_error"] = f"could not open install folder: {err}"
+
+    def open_stats():
         webbrowser.open(stats_url)
 
     def toggle_pause():
@@ -1354,26 +1872,41 @@ def run_ui(stats_url):
         STOP_EVENT.set()
         root.destroy()
 
+    def uninstall_worker():
+        if not messagebox.askyesno(
+            "Uninstall TokenBroker Worker",
+            "Stop the worker, remove it from startup, and delete its files?\n\nOllama itself is left installed.",
+        ):
+            return
+        STOP_EVENT.set()
+        root.withdraw()
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
+        target = os.path.join(app_dir(), "uninstall.bat")
+        if not os.path.exists(target):
+            target = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uninstall.bat")
+        try:
+            _popen_hidden(["cmd", "/c", target])
+        except Exception:
+            pass
+        root.destroy()
+
     def connect_cloud():
         def do_signin():
             try:
                 bin_path = ollama_bin()
                 if not bin_path:
-                    STATE["last_error"] = (
-                        "Ollama CLI not found - install Ollama from https://ollama.com"
-                    )
+                    STATE["last_error"] = "Ollama CLI not found - install Ollama from https://ollama.com"
                     return
-                # Ollama >= 0.30 uses `signin`; older builds used `login`.
                 try:
                     proc = _popen_hidden([bin_path, "signin"])
                 except FileNotFoundError:
                     proc = _popen_hidden([bin_path, "login"])
-                # The browser flow prints an auth URL. Show it live in the
-                # worker status AND open it so the user can complete sign-in -
-                # the window is hidden, so we can't rely on console output.
                 url = None
                 lines = []
-                deadline = time.time() + 300
+                deadline = time.time() + 60
                 while time.time() < deadline and proc.poll() is None:
                     line = proc.stdout.readline()
                     if line:
@@ -1385,7 +1918,6 @@ def run_ui(stats_url):
                             STATE["last_error"] = f"Open this link to finish sign-in: {url}"
                             try:
                                 import webbrowser
-
                                 webbrowser.open(url)
                             except Exception:
                                 pass
@@ -1416,6 +1948,10 @@ def run_ui(stats_url):
         STATE["cloud"]["enabled"] = not STATE["cloud"].get("enabled", False)
         save_cloud_state()
 
+    def toggle_private():
+        STATE["private_jobs"] = not STATE.get("private_jobs", True)
+        save_config_pref("private_jobs", STATE["private_jobs"])
+
     def hide_to_tray():
         root.withdraw()
         if ui["icon"] is not None:
@@ -1436,142 +1972,144 @@ def run_ui(stats_url):
             quit_worker()
 
     def on_minimize(_event):
-        # Minimizing (iconify) tucks the worker into the tray (bottom-right),
-        # so it stays available 24/7 without occupying the taskbar.
         if ui["icon"] is not None and root.state() == "iconic":
             root.after(150, hide_to_tray)
 
     def build_tray_menu():
         from pystray import Menu, MenuItem
-
         paused = PAUSE_EVENT.is_set()
         return Menu(
             MenuItem("Show window", lambda: ui_thread_safe(show_from_tray), default=True),
             MenuItem("Hide window", lambda: ui_thread_safe(hide_to_tray)),
             MenuItem("Resume" if paused else "Pause", lambda: ui_thread_safe(toggle_pause)),
             MenuItem("Sign in to Ollama", lambda: ui_thread_safe(connect_cloud)),
+            MenuItem("Accept private jobs: " + ("on" if STATE.get("private_jobs", True) else "off"), lambda: ui_thread_safe(toggle_private)),
+            MenuItem("Uninstall worker...", lambda: ui_thread_safe(uninstall_worker)),
             Menu.SEPARATOR,
-            MenuItem(
-                "Quit",
-                lambda: (
-                    ui["icon"].stop() if ui["icon"] is not None else None,
-                    ui_thread_safe(quit_worker),
-                ),
-            ),
+            MenuItem("Quit", lambda: (ui["icon"].stop() if ui["icon"] is not None else None, ui_thread_safe(quit_worker))),
         )
 
-    tk.Button(buttons, text="Open details", command=open_details, bg="#2563eb", fg="white", relief="flat", padx=12, pady=4).pack(side="left", padx=5)
-    tk.Button(buttons, text="Sign in", command=connect_cloud, bg="#161922", fg="white", relief="flat", padx=12, pady=4).pack(side="left", padx=5)
-    cloud_btn = tk.Button(buttons, text="Cloud off", command=toggle_cloud, bg="#161922", fg="white", relief="flat", padx=12, pady=4)
-    cloud_btn.pack(side="left", padx=5)
-    pause_btn = tk.Button(buttons, text="Pause", command=toggle_pause, bg="#161922", fg="white", relief="flat", padx=12, pady=4)
-    pause_btn.pack(side="left", padx=5)
-    tk.Button(buttons, text="Quit", command=quit_worker, bg="#7f1d1d", fg="white", relief="flat", padx=12, pady=4).pack(side="left", padx=5)
+    mkbtn(br1, "Open folder", open_details, 0, 0, fg="#0b0e14", bg=ACCENT)
+    mkbtn(br1, "Sign in", connect_cloud, 1, 0)
+    cloud_btn = mkbtn(br1, "Cloud off", toggle_cloud, 2, 0)
+    mkbtn(br1, "Quit", quit_worker, 3, 0, fg="#ffffff", bg=BAD)
+    private_btn = mkbtn(br2, "Priv on", toggle_private, 0, 0)
+    pause_btn = mkbtn(br2, "Pause", toggle_pause, 1, 0)
+    mkbtn(br2, "Uninstall", uninstall_worker, 2, 0, fg="#ffb454", bg="#2a2018")
+    mkbtn(br2, "Stats", open_stats, 3, 0)
 
     start_tray(root, ui, build_tray_menu)
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.bind("<Unmap>", on_minimize)
 
+    def fmt_uptime(secs):
+        secs = int(secs or 0)
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
+
     def refresh():
         s = STATE
         st = s.get("job_state", "idle")
         if s.get("status") == "gateway unreachable":
-            label, color = "Offline - gateway unreachable", "#ef4444"
+            label, color = "Offline - gateway unreachable", BAD
         elif s.get("status") in ("flagged", "revoked"):
-            label, color = "Suspended by network", "#ef4444"
+            label, color = "Suspended by network", BAD
         elif st == "paused":
-            label, color = "Paused", "#9ca3af"
+            label, color = "Paused", MUTED
         elif st == "working":
-            label, color = f"Working: {s.get('current_job')}", "#22c55e"
+            label, color = f"Working: {s.get('current_job')}", GOOD
         elif st == "pulling":
-            label, color = f"Pulling model: {s.get('current_job')}", "#fbbf24"
+            label, color = f"Pulling model: {s.get('current_job')}", WARN
         else:
-            label, color = "Running - idle", "#22c55e"
+            label, color = "Running - idle", GOOD
         status.config(text=label, fg=color)
         if ui["icon"] is not None:
             try:
                 ui["icon"].title = f"TokenBroker Worker - {label}"
             except Exception:
                 pass
+
+        jobs_val.config(text=f"{s.get('jobs_completed', 0)} done / {s.get('jobs_failed', 0)} fail")
+        tok_val.config(text=f"{s.get('tokens', 0):,}")
+        cred_val.config(text=f"{s.get('credits', 0):,} {s.get('credits_tier') or ''}".strip())
+        rpm_val.config(text=f"{s.get('rpm', 0)}")
+        up_val.config(text=fmt_uptime(time.time() - s.get("started_at", time.time())))
+        cloud = s.get("cloud") or {}
+        if cloud.get("enabled") and cloud.get("auth_ok") is True:
+            cloud_val.config(text=cloud.get("account") or "signed in", fg=GOOD)
+        elif cloud.get("enabled") and cloud.get("auth_ok") is False:
+            cloud_val.config(text="signed out", fg=BAD)
+        else:
+            cloud_val.config(text="off" if not cloud.get("enabled") else "?", fg=MUTED)
+
         quality = s.get("quality") or {}
         verified = s.get("worker_verified")
-        cloud = s.get("cloud") or {}
         cloud_btn.config(text="Cloud on" if cloud.get("enabled") else "Cloud off")
+        private_btn.config(text="Priv on" if s.get("private_jobs", True) else "Priv off")
         info.config(
             text=(
-                f"Gateway : {s.get('gateway', '-')}\n"
-                f"GPU     : {s.get('gpu') or 'CPU only'}\n"
-                f"Storage : {s.get('storage_gb', 0):.0f}GB model budget\n"
-                f"CPU     : {s.get('cpu_pct', 0):.0f}%   GPU util: {s.get('gpu_util') or 0:.0f}%\n"
-                f"Jobs    : {s.get('jobs_completed', 0)} done / {s.get('jobs_failed', 0)} failed\n"
-                f"Tokens  : {s.get('tokens', 0):,}\n"
-                f"Credits : {s.get('credits', 0):,} {s.get('credits_tier') or ''}\n"
-                f"Rank    : {quality.get('tier') or '-'}   est. {quality.get('tps') or 0} tok/s   "
-                f"{quality.get('daily_credits') or 0}/day\n"
-                f"Fingerprint: {str(s.get('fingerprint') or '-')[:16]}\n"
-                f"VM check: {s.get('vm', {}).get('score')}   "
-                f"Build: {'verified' if verified is True else 'MODIFIED' if verified is False else 'n/a'}\n"
-                f"Cloud: {'on' if cloud.get('enabled') else 'off'} | auth "
-                f"{'ok' if cloud.get('auth_ok') is True else 'no' if cloud.get('auth_ok') is False else '?'} | "
-                f"acct {'hidden (private mode)' if s.get('private_mode') else (cloud.get('account') if cloud.get('login') else ('signed out' if cloud.get('auth_ok') is False else 'not signed in'))} | "
-                f"used {cloud.get('used_tokens_per_hour', 0):,} / {cloud.get('quota_per_hour', 0):,} "
-                f"(rem {cloud.get('remaining', 0):,})\n"
-                f"Cloud: installed {'yes' if cloud.get('installed') else 'no'} | "
-                f"burned {cloud.get('total_tokens', 0):,} tokens this session\n"
-                f"Pool: {s.get('pool_count', 0)} models, {s.get('pool_mb', 0)} MB - "
-                f"evict idle >{s.get('max_pool_idle_hours', 2)}h (evictions: {s.get('pool_evictions', 0)})"
+                f"Gateway  : {s.get('gateway', '-')}\n"
+                f"Identity : fp {str(s.get('fingerprint') or '-')[:12]}  build {'verified' if verified is True else 'MODIFIED' if verified is False else 'n/a'}\n"
+                f"Storage  : {s.get('storage_gb', 0):.0f} GB model budget  |  VM score: {s.get('vm', {}).get('score')}\n"
+                f"Rank     : {quality.get('tier') or '-'}  est {quality.get('tps') or 0} tok/s  {quality.get('daily_credits') or 0}/day\n"
+                f"Cloud    : {'on' if cloud.get('enabled') else 'off'}  used {cloud.get('used_tokens_per_hour', 0):,}/{cloud.get('quota_per_hour', 0):,}  rem {cloud.get('remaining', 0):,}\n"
+                f"Private  : {'accepting jobs' if s.get('private_jobs', True) else 'off'}  |  Pool: {s.get('pool_count', 0)} models, {s.get('pool_mb', 0)} MB"
             )
         )
+
         chart.delete("all")
         hist = s.get("history") or []
         n = len(hist)
         if n:
-            w, h = 390, 130
-            pad_l, pad_b = 8, 18
-            iw, ih = w - pad_l - 8, h - pad_b - 16
+            w, h, pad_l, pad_t, pad_b = 430, 118, 8, 8, 20
+            iw, ih = w - pad_l - 8, h - pad_t - pad_b
             max_rpm = max(1, max(x.get("rpm", 0) for x in hist))
-            for i, x in enumerate(hist):
-                x0 = pad_l + (i / max(1, n - 1)) * iw
-                x1 = pad_l + ((i + 1) / max(1, n - 1)) * iw
-                y0 = 4
-                y1 = y0 + 14 if x.get("online") else y0 + 3
-                chart.create_rectangle(
-                    x0, y0, x1, y1,
-                    fill="#22c55e" if x.get("online") else "#ef4444",
-                    outline="",
-                )
-            pts = []
+            max_tok = max(1, max(x.get("tokens", 0) for x in hist))
+            rpm_pts, tok_pts = [], []
             for i, x in enumerate(hist):
                 px = pad_l + (i / max(1, n - 1)) * iw
-                py = 22 + ih - (x.get("rpm", 0) / max_rpm) * ih
-                pts.extend((px, py))
-            if len(pts) > 2:
-                chart.create_line(*pts, fill="#60a5fa", width=2)
+                rpm_pts.extend((px, pad_t + ih - (x.get("rpm", 0) / max_rpm) * ih))
+                tok_pts.extend((px, pad_t + ih - (x.get("tokens", 0) / max_tok) * ih))
+                if not x.get("online"):
+                    chart.create_rectangle(px - 2, pad_t, px + 2, pad_t + ih, fill="#7f1d1d", outline="")
+            if len(rpm_pts) > 2:
+                chart.create_line(*rpm_pts, fill=ACCENT, width=2)
+            if len(tok_pts) > 2:
+                chart.create_line(*tok_pts, fill=GOOD, width=2)
             chart.create_text(
-                pad_l + 4,
-                h - 4,
-                anchor="w",
-                text=f"green=online · blue=requests/min (max {max_rpm}) · last {n} samples",
-                fill="#9ca3af",
-                font=("Segoe UI", 8),
+                pad_l + 4, h - 6, anchor="w",
+                text=f"blue req/min (max {max_rpm})  green tok/min (max {max_tok})  red bar = offline",
+                fill=MUTED, font=("Segoe UI", 8),
             )
-        job = s.get("last_job")
-        if job:
-            last.config(
-                text=(
-                    f"Last job: {job.get('model')} ({job.get('kind')}) - "
-                    f"{job.get('tokens', 0)} tokens, +{job.get('credits', 0)} {job.get('credit_tier') or ''}\n"
-                    f"Prompt: {job.get('redacted_prompt')} (redacted)"
-                )
+
+        tree.delete(*tree.get_children())
+        for j in reversed((s.get("job_history") or [])[-60:]):
+            tree.insert(
+                "", "end",
+                values=(
+                    j.get("t", ""),
+                    j.get("model", ""),
+                    j.get("tokens", ""),
+                    j.get("credits", ""),
+                    j.get("latency_ms", "") if j.get("latency_ms") is not None else "",
+                    "ok" if j.get("ok") else "FAIL",
+                ),
             )
-        else:
-            last.config(text="Last job: none yet")
+
+        err = s.get("last_error")
+        last.config(text=err or "", fg=WARN if err else MUTED)
+
         root.after(2000, refresh)
 
     def drain_ui_commands():
         try:
             while True:
-                ui_commands.get_nowait()()
+                fn = ui_commands.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
         except queue.Empty:
             pass
         root.after(200, drain_ui_commands)
@@ -1590,6 +2128,8 @@ def main():
     ap.add_argument("--name", default="My Worker")
     ap.add_argument("--interval", type=int, default=30)
     ap.add_argument("--headless", action="store_true", help="Run without the UI window")
+    ap.add_argument("--no-private-jobs", action="store_true", help="Never claim private (Hiro-encoded) jobs")
+    ap.add_argument("--dry-run", action="store_true", help="Test mode: return a canned response instead of calling Ollama")
     ap.add_argument(
         "--multi",
         action="store_true",
@@ -1617,6 +2157,10 @@ def main():
         cfg = {}
     args.name = cfg.get("name", args.name)
     private_jobs = cfg.get("private_jobs", True)
+    if args.no_private_jobs:
+        private_jobs = False
+    STATE["private_jobs"] = private_jobs
+    STATE["dry_run"] = args.dry_run
     STATE["cloud"]["enabled"] = bool(cfg.get("cloud_enabled", False))
     STATE["cloud"]["quota_per_hour"] = int(cfg.get("cloud_quota_per_hour", 100000) or 100000)
     STATE["cloud"]["remaining"] = STATE["cloud"]["quota_per_hour"]
@@ -1631,7 +2175,54 @@ def main():
     # restarts, then re-verify the live session in the background so cloud
     # models are only advertised when the session is actually valid.
     load_cloud_state()
-    threading.Thread(target=verify_cloud_account, daemon=True).start()
+
+    def _boot_verify():
+        for _ in range(3):
+            verify_cloud_account()
+            if STATE["cloud"].get("auth_ok") is True:
+                return
+            time.sleep(5)
+
+    threading.Thread(target=_boot_verify, daemon=True).start()
+
+    def _probe_subscription():
+        """Probe a known pay-gated Ollama model to learn the account tier.
+
+        Ollama returns HTTP 402 immediately when the signed-in ollama.com
+        account cannot serve a pay-gated model, so a tiny 1-token probe tells
+        us whether this worker is on a free or paying plan. Free cloud models
+        are never used as probes (they would 200 on a free account).
+        """
+        if not ollama_bin():
+            return
+        candidates = [
+            cfg.get("cloud_probe_model", ""),
+            "kimi-k3:cloud",
+            "Beelzebub4883/arriella-ascension-dsv4flash-cloud",
+            "deepseek-v4-flash:0731",
+        ]
+        candidates = [m for m in candidates if m]
+        for attempt in range(3):
+            for probe in candidates:
+                try:
+                    http_json(
+                        OLLAMA + "/api/chat",
+                        {"model": probe, "messages": [{"role": "user", "content": "ping"}], "stream": False, "options": {"num_predict": 1}},
+                        timeout=30,
+                    )
+                    STATE["cloud"]["subscription"] = "paying"
+                    save_cloud_state()
+                    return
+                except Exception as err:
+                    if getattr(err, "code", None) == 402 or "402" in str(err) or "Payment Required" in str(err):
+                        STATE["cloud"]["subscription"] = "free"
+                        save_cloud_state()
+                        return
+            time.sleep(5)
+        STATE["cloud"]["subscription"] = "unknown"
+        save_cloud_state()
+
+    threading.Thread(target=_probe_subscription, daemon=True).start()
     # Restore the on-demand-pull tracker and evict anything already idle past
     # the limit (e.g. pulls from a previous session).
     load_pool_state()
