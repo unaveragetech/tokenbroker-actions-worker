@@ -61,7 +61,7 @@ start_worker() {
   LOGS+=("$log")
   # -multi: skip the single-instance check; the three workers are separate
   # nodes (separate tokens) that share the one local Ollama.
-  ( timeout "${RUN_FOR}m" python -u worker.py --config "$cfg" --headless --multi 2>&1 \
+  ( timeout "${RUN_FOR}m" python -u -X faulthandler worker.py --config "$cfg" --headless --multi 2>&1 \
       | tee "$log" | sed -u "s/^/[w$idx] /" ) &
   PIDS+=($!)
 }
