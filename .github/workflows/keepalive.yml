@@ -1,0 +1,54 @@
+name: Keepalive (monthly prompt)
+
+# GitHub disables scheduled workflows in a repo with no activity for 60 days,
+# which would silently take the standing nodes offline. Every 30 days or so
+# this sends ONE real prompt through the TokenBroker network (proving the
+# nodes answer) and re-enables the worker workflow, which resets that clock.
+on:
+  schedule:
+    - cron: '17 6 1,31 * *'   # twice a month at most; gaps never exceed ~31 days
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Re-enable workflows (resets the 60-day inactivity timer)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow enable worker.yml --repo "$GITHUB_REPOSITORY" || true
+          gh workflow enable keepalive.yml --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Send one prompt through the network
+        env:
+          TB_GATEWAY: ${{ secrets.TB_GATEWAY }}
+          TB_API_KEY: ${{ secrets.TB_API_KEY }}
+          KEEPALIVE_MODEL: llama3.2:1b
+        run: |
+          if [ -z "${TB_API_KEY:-}" ]; then
+            echo "::warning::TB_API_KEY secret not set - skipped the prompt (workflows were still re-enabled)"
+            exit 0
+          fi
+          # A cold node may need to pull the model first, so allow a few minutes
+          # and retry (the gateway returns 503 until a node can take the job).
+          for attempt in 1 2 3 4; do
+            code=$(curl -sS -m 240 -o resp.json -w '%{http_code}' \
+              "$TB_GATEWAY/v1/chat/completions" \
+              -H "Authorization: Bearer $TB_API_KEY" -H 'Content-Type: application/json' \
+              -d "{\"model\":\"$KEEPALIVE_MODEL\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: alive\"}]}") || code=000
+            echo "attempt $attempt -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              python3 -c "import json;print(json.load(open('resp.json'))['choices'][0]['message']['content'])"
+              exit 0
+            fi
+            head -c 300 resp.json 2>/dev/null; echo
+            sleep 60
+          done
+          echo "::error::Keepalive prompt failed - the standing nodes may be down"
+          exit 1
