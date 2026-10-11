@@ -7,13 +7,14 @@ launches **three worker instances that share one local Ollama server**
 Models pulled by one worker are instantly available to the others, and an
 Actions cache shares models across runs too.
 
-The schedule re-fires every 5 hours (Actions jobs max ~6h), so the nodes come
-back with only a short gap.
+A run lasts ~5h50m and the schedule re-fires every 6 hours (Actions jobs max
+~6h), so the nodes come back with only a short gap. A concurrency group stops
+two runs from ever sharing the same node tokens.
 
 ## Setup
 
-1. Add two repository secrets:
-   - `TB_GATEWAY` = `https://tokenbroker-edge.tokenbroker.workers.dev`
+1. Add the repository secrets:
+   - `TB_GATEWAY` = `https://tokenbroker.org`
    - `TB_NODE_TOKEN` = the node token minted for this worker (shown once)
    - `TB_NODE_TOKEN_2`, `TB_NODE_TOKEN_3` = tokens for the 2nd and 3rd workers
 2. Push this repo. The scheduled workflow keeps the node standing; run
@@ -35,3 +36,15 @@ back with only a short gap.
 - The runner IP changes per run - the hub records it but does not bind the
   node to a single IP.
 - `private_jobs` is off: this node never claims Hiro-encoded private jobs.
+
+## Troubleshooting
+
+Worker output streams into the "Run 3 headless workers" step log, prefixed
+`[w1]`/`[w2]`/`[w3]`. If the gateway rejects every node within 90s (revoked or
+wrong token, gateway unreachable) the step fails with an `::error::` annotation
+and the last lines of each worker log - a red run means the nodes are not
+standing. Mint replacement tokens in the TokenBroker admin console and update
+the `TB_NODE_TOKEN*` secrets.
+
+GitHub disables scheduled workflows after 60 days without repository activity;
+re-enable it from the Actions tab (or push any commit) if the nodes go quiet.
